@@ -14,11 +14,11 @@ mod download;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Entity {
-    label: String,
-    score: f32,
-    word: String,
-    start: usize,
-    end: usize,
+    pub label: String,
+    pub score: f32,
+    pub word: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Deserialize)]
