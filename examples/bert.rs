@@ -8,7 +8,7 @@ fn main() -> Result<(), trast::Error> {
     let mut pipeline = Pipeline::from_pretrained(&env, "amcoff/bert-based-swedish-cased-ner")?;
 
     let start = Instant::now();
-    let output = pipeline.predict("Idag släpper KB tre nya språkmodeller.")?;
+    let output = pipeline.predict("Idag släpper Kungliga biblioteket tre nya språkmodeller.")?;
     let duration = start.elapsed();
 
     println!("{output:?}");

@@ -32,6 +32,14 @@ pub struct Pipeline<'a> {
     session: Session<'a>,
 }
 
+#[derive(Debug)]
+struct RawEntity {
+    label: i64,
+    score: f32,
+    start: usize,
+    end: usize,
+}
+
 impl<'a> Pipeline<'a> {
     pub fn from_files(
         env: &'a Environment,
@@ -71,9 +79,10 @@ impl<'a> Pipeline<'a> {
     }
 
     pub fn predict(&mut self, sentence: impl AsRef<str>) -> Result<Vec<Entity>> {
+        let sentence = sentence.as_ref();
         let input = self
             .tokenizer
-            .encode(EncodeInput::Single(sentence.as_ref().into()), true)?;
+            .encode(EncodeInput::Single(sentence.into()), true)?;
 
         let ids: Vec<i64> = input.get_ids().iter().map(|x| (*x).into()).collect();
         let ids = ndarray::Array::from_vec(ids)
@@ -97,38 +106,57 @@ impl<'a> Pipeline<'a> {
         let outputs: Vec<tensor::OrtOwnedTensor<f32, _>> =
             self.session.run(vec![ids, attention_mask, type_ids])?;
 
-        let entities = outputs[0]
-            .rows()
+        let mut entities: Vec<RawEntity> = vec![];
+
+        for (i, scores) in outputs[0].rows().into_iter().enumerate() {
+            let mut sum = 0.;
+            let mut max = f32::MIN;
+            let mut label = 0;
+
+            for (i, z) in scores.iter().enumerate() {
+                let z = z.exp();
+                sum += z;
+                if z > max {
+                    max = z;
+                    label = i as _;
+                }
+            }
+
+            let score = max / sum;
+            let (start, end) = input.get_offsets()[i];
+
+            match entities.last_mut() {
+                Some(prev) if prev.label == label => {
+                    prev.score = prev.score.max(score);
+                    prev.start = prev.start.min(start);
+                    prev.end = prev.end.max(end);
+                }
+                _ => entities.push(RawEntity {
+                    label,
+                    score,
+                    start,
+                    end,
+                }),
+            }
+        }
+
+        let entities = entities
             .into_iter()
-            .enumerate()
-            .filter_map(|(i, scores)| {
-                let mut sum = 0.;
-                let mut max = f32::MIN;
-                let mut label = 0;
-
-                for (i, z) in scores.iter().enumerate() {
-                    let z = z.exp();
-                    sum += z;
-                    if z > max {
-                        max = z;
-                        label = i as _;
-                    }
-                }
-
-                if label == 0 {
-                    None
-                } else {
-                    let (start, end) = input.get_offsets()[i];
-
-                    Some(Entity {
-                        label: self.config.id2label[&label].clone(),
-                        score: max / sum,
-                        word: input.get_tokens()[i].clone(),
-                        start,
-                        end,
-                    })
-                }
-            })
+            .filter(|e| e.label != 0 && e.end > e.start)
+            .map(
+                |RawEntity {
+                     label,
+                     score,
+                     start,
+                     end,
+                 }| Entity {
+                    label: self.config.id2label[&label].clone(),
+                    score,
+                    word: sentence[start..end].to_owned(),
+                    start,
+                    end,
+                },
+            )
             .collect::<Vec<Entity>>();
 
         Ok(entities)
