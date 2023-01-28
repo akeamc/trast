@@ -1,16 +1,15 @@
-use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
+use std::{collections::HashMap, fmt::Debug, fs::File, io::BufReader, path::Path};
 
-use onnxruntime::{
-    environment::Environment, ndarray, session::Session, tensor, GraphOptimizationLevel, OrtError,
-};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokenizers::{EncodeInput, Tokenizer};
+use tract_onnx::{
+    prelude::{tvec, Framework, Graph, InferenceModelExt, SimplePlan, Tensor, TypedFact, TypedOp},
+    tract_hir::tract_ndarray::{Array2, ShapeError},
+};
 
-pub use onnxruntime;
-
-#[cfg(feature = "download")]
-mod download;
+#[cfg(feature = "remote")]
+mod remote;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Entity {
@@ -21,15 +20,17 @@ pub struct Entity {
     pub end: usize,
 }
 
+pub struct Pipeline {
+    tokenizer: Tokenizer,
+    config: Config,
+    model: Model,
+}
+
+type Model = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+
 #[derive(Debug, Deserialize)]
 struct Config {
     id2label: HashMap<i64, String>,
-}
-
-pub struct Pipeline<'a> {
-    tokenizer: Tokenizer,
-    config: Config,
-    session: Session<'a>,
 }
 
 #[derive(Debug)]
@@ -40,75 +41,79 @@ struct RawEntity {
     end: usize,
 }
 
-impl<'a> Pipeline<'a> {
+impl Pipeline {
     pub fn from_files(
-        env: &'a Environment,
         config: impl AsRef<Path>,
         tokenizer: impl AsRef<Path>,
-        model: impl AsRef<Path> + 'a,
+        model: impl AsRef<Path>,
     ) -> Result<Self> {
         let config: Config = serde_json::from_reader(BufReader::new(File::open(config)?))?;
         let tokenizer = Tokenizer::from_file(tokenizer)?;
-        let session = env
-            .new_session_builder()?
-            .with_optimization_level(GraphOptimizationLevel::All)?
-            .with_model_from_file(model)?;
+        let model = tract_onnx::onnx()
+            .model_for_path(model)?
+            .into_optimized()?
+            .into_runnable()?;
 
         Ok(Self {
             tokenizer,
             config,
-            session,
+            model,
         })
     }
 
-    #[cfg(feature = "download")]
-    pub fn from_pretrained(env: &'a Environment, model: impl AsRef<str>) -> Result<Self> {
+    #[cfg(feature = "remote")]
+    pub fn from_pretrained(model: impl AsRef<str>) -> Result<Self> {
         let model = model.as_ref();
         let download_file = |file: &str| {
-            download::download(format!(
+            remote::download(format!(
                 "https://huggingface.co/{model}/resolve/main/{file}"
             ))
         };
 
         Self::from_files(
-            env,
             download_file("config.json")?,
             download_file("tokenizer.json")?,
             download_file("model.onnx")?,
         )
     }
 
-    pub fn predict(&mut self, sentence: impl AsRef<str>) -> Result<Vec<Entity>> {
+    pub fn predict(&self, sentence: impl AsRef<str>) -> Result<Vec<Entity>> {
         let sentence = sentence.as_ref();
         let input = self
             .tokenizer
             .encode(EncodeInput::Single(sentence.into()), true)?;
 
-        let ids: Vec<i64> = input.get_ids().iter().map(|x| (*x).into()).collect();
-        let ids = ndarray::Array::from_vec(ids)
-            .into_shape((1, input.len()))
-            .unwrap();
+        let input_ids: Tensor = Array2::from_shape_vec(
+            (1, input.len()),
+            input.get_ids().iter().map(|&x| x as i64).collect(),
+        )?
+        .into();
+        let attention_mask: Tensor = Array2::from_shape_vec(
+            (1, input.len()),
+            input
+                .get_attention_mask()
+                .iter()
+                .map(|&x| x as i64)
+                .collect(),
+        )?
+        .into();
+        let token_type_ids: Tensor = Array2::from_shape_vec(
+            (1, input.len()),
+            input.get_type_ids().iter().map(|&x| x as i64).collect(),
+        )?
+        .into();
 
-        let attention_mask: Vec<i64> = input
-            .get_attention_mask()
-            .iter()
-            .map(|x| (*x).into())
-            .collect();
-        let attention_mask = ndarray::Array::from_vec(attention_mask)
-            .into_shape((1, input.len()))
-            .unwrap();
-
-        let type_ids: Vec<i64> = input.get_type_ids().iter().map(|x| (*x).into()).collect();
-        let type_ids = ndarray::Array::from_vec(type_ids)
-            .into_shape((1, input.len()))
-            .unwrap();
-
-        let outputs: Vec<tensor::OrtOwnedTensor<f32, _>> =
-            self.session.run(vec![ids, attention_mask, type_ids])?;
+        let outputs = self.model.run(tvec![
+            input_ids.into(),
+            attention_mask.into(),
+            token_type_ids.into()
+        ])?;
 
         let mut entities: Vec<RawEntity> = vec![];
 
-        for (i, scores) in outputs[0].rows().into_iter().enumerate() {
+        let logits = outputs[0].to_array_view::<f32>()?;
+
+        for (i, scores) in logits.rows().into_iter().enumerate() {
             let mut sum = 0.;
             let mut max = f32::MIN;
             let mut label = 0;
@@ -167,15 +172,17 @@ impl<'a> Pipeline<'a> {
 pub enum Error {
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    #[cfg(feature = "download")]
-    #[cfg_attr(feature = "download", error("{0}"))]
+    #[cfg(feature = "remote")]
+    #[cfg_attr(feature = "remote", error("{0}"))]
     Download(#[from] cached_path::Error),
     #[error("{0}")]
     Serde(#[from] serde_json::Error),
     #[error("{0}")]
-    Onnx(#[from] OrtError),
+    Onnx(#[from] tract_onnx::tract_core::anyhow::Error),
     #[error("tokenizer error")]
     Tokenizer,
+    #[error("shape error: {0}")]
+    Shape(#[from] ShapeError),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for Error {

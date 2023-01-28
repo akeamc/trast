@@ -1,11 +1,9 @@
 use std::time::Instant;
 
-use onnxruntime::environment::Environment;
 use trast::Pipeline;
 
 fn main() -> Result<(), trast::Error> {
-    let env = Environment::builder().build()?;
-    let mut pipeline = Pipeline::from_pretrained(&env, "amcoff/bert-based-swedish-cased-ner")?;
+    let pipeline = Pipeline::from_pretrained("amcoff/bert-based-swedish-cased-ner")?;
 
     let start = Instant::now();
     let output = pipeline.predict("Idag släpper Kungliga biblioteket tre nya språkmodeller.")?;
