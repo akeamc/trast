@@ -1,17 +1,17 @@
 [package]
 name = "trast"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.6.4"
 tokio = { version = "1.24.2", features = ["rt-multi-thread", "macros", "time"] }
 onnx-bert = { path = "../onnx-bert", default-features = false, features = ["remote", "tracing"] }
 thiserror = "1.0.38"
-arc-swap = "1.6.0"
 tokio-rayon = "2.1.0"
 futures = "0.3.25"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 dotenv = "0.15.0"
-serde = { version = "1.0.152", features = ["derive"] }
+trast-proto = { path = "../trast-proto" }
+tonic = "0.8.3"
+tonic-health = "0.8.0"

@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package trast;
+
+service Trast {
+    rpc Ner (NerInput) returns (NerOutput) {}
+}
+
+message NerInput {
+    string sentence = 1;
+}
+
+message NerOutput {
+    repeated Entity entities = 1;
+}
+
+message Entity {
+    string word = 1;
+    string label = 2;
+    float score = 3;
+    uint32 start = 4;
+    uint32 end = 5;
+}

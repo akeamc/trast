@@ -1,26 +1,61 @@
 use std::{sync::Arc, time::Duration};
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
-use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 use onnx_bert::{Entity, Pipeline};
-use serde::Serialize;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
     task::{spawn_blocking, JoinError, JoinHandle},
     time::sleep,
 };
+use tonic::{transport::Server, Request, Response, Status};
 use tracing::{debug, info, instrument};
+use trast_proto::{
+    trast_server::{Trast, TrastServer},
+    NerInput, NerOutput,
+};
 
-type Message = (Vec<String>, oneshot::Sender<Result<Vec<Vec<Entity>>>>);
+struct TrastService {
+    actor_tx: mpsc::Sender<Message>,
+}
+
+#[tonic::async_trait]
+impl Trast for TrastService {
+    async fn ner(&self, request: Request<NerInput>) -> Result<Response<NerOutput>, Status> {
+        let (tx, rx) = oneshot::channel();
+        let NerInput { sentence } = request.into_inner();
+        self.actor_tx.send((sentence, tx)).await.unwrap();
+        let entities = rx.await.unwrap()?.into_iter().map(
+            |onnx_bert::Entity {
+                 label,
+                 score,
+                 word,
+                 start,
+                 end,
+             }| trast_proto::Entity {
+                label,
+                score,
+                word,
+                start: start.try_into().unwrap(),
+                end: end.try_into().unwrap(),
+            },
+        );
+
+        Ok(Response::new(NerOutput {
+            entities: entities.into_iter().map(Into::into).collect(),
+        }))
+    }
+}
+
+type Message = (String, oneshot::Sender<Result<Vec<Entity>>>);
 
 type Result<T, E = Error> = core::result::Result<T, E>;
+
+impl From<Error> for Status {
+    fn from(value: Error) -> Self {
+        Self::internal(value.to_string())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -28,12 +63,6 @@ enum Error {
     Join(#[from] JoinError),
     #[error("{0}")]
     Bert(#[from] onnx_bert::Error),
-}
-
-impl IntoResponse for Error {
-    fn into_response(self) -> axum::response::Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
-    }
 }
 
 type Handles = FuturesUnordered<JoinHandle<()>>;
@@ -48,7 +77,7 @@ async fn get_pipeline() -> Result<Pipeline> {
 }
 
 async fn handle_msg(
-    (sentences, tx): Message,
+    (sentence, tx): Message,
     handles: &mut Handles,
     pipeline: &mut Option<Arc<Pipeline>>,
 ) {
@@ -69,12 +98,7 @@ async fn handle_msg(
     let pipeline = Arc::clone(pipeline.as_ref().unwrap());
 
     let handle = tokio::spawn(async move {
-        let res = try_join_all(sentences.into_iter().map(move |s| {
-            let pipeline = Arc::clone(&pipeline);
-            tokio_rayon::spawn(move || pipeline.predict(s))
-        }))
-        .await;
-
+        let res = tokio_rayon::spawn(move || pipeline.predict(sentence)).await;
         let _ = tx.send(res.map_err(Into::into));
     });
 
@@ -110,51 +134,26 @@ fn act() -> mpsc::Sender<Message> {
     tx
 }
 
-#[derive(Debug, Clone)]
-struct AppState {
-    actor_tx: mpsc::Sender<Message>,
-}
-
-async fn predict(
-    State(s): State<AppState>,
-    Json(sentences): Json<Vec<String>>,
-) -> Result<impl IntoResponse> {
-    let (tx, rx) = oneshot::channel();
-    s.actor_tx.send((sentences, tx)).await.unwrap();
-    let res = rx.await.unwrap()?;
-
-    Ok(Json(res))
-}
-
-#[derive(Debug, Serialize)]
-struct Health {
-    version: &'static str,
-}
-
-async fn health() -> impl IntoResponse {
-    (
-        [("cache-control", "no-cache")],
-        Json(Health {
-            version: env!("CARGO_PKG_VERSION"),
-        }),
-    )
-}
-
 #[tokio::main]
 async fn main() {
     let _ = dotenv::dotenv();
     tracing_subscriber::fmt::init();
 
-    let actor_tx = act();
-    let app = Router::new()
-        .route("/", post(predict))
-        .route("/health", get(health))
-        .with_state(AppState { actor_tx });
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<TrastServer<TrastService>>()
+        .await;
 
-    info!("binding");
+    let addr = "[::1]:8000".parse().unwrap();
 
-    axum::Server::bind(&"0.0.0.0:8000".parse().unwrap())
-        .serve(app.into_make_service())
+    let trast = TrastService { actor_tx: act() };
+
+    info!("listening on {addr}");
+
+    Server::builder()
+        .add_service(health_service)
+        .add_service(TrastServer::new(trast))
+        .serve(addr)
         .await
         .unwrap();
 }
