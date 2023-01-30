@@ -3,6 +3,8 @@ use std::{collections::HashMap, fmt::Debug, fs::File, io::BufReader, path::Path}
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokenizers::{EncodeInput, Tokenizer};
+#[cfg(feature = "tracing")]
+use tracing::{debug, instrument};
 use tract_onnx::{
     prelude::{tvec, Framework, Graph, InferenceModelExt, SimplePlan, Tensor, TypedFact, TypedOp},
     tract_hir::tract_ndarray::{Array2, ShapeError},
@@ -77,6 +79,7 @@ impl Pipeline {
         )
     }
 
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
     pub fn predict(&self, sentence: impl AsRef<str>) -> Result<Vec<Entity>> {
         let sentence = sentence.as_ref();
         let input = self
@@ -163,6 +166,9 @@ impl Pipeline {
                 },
             )
             .collect::<Vec<Entity>>();
+
+        #[cfg(feature = "tracing")]
+        debug!("recognized {} entities", entities.len());
 
         Ok(entities)
     }

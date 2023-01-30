@@ -1,15 +1,22 @@
 use std::{sync::Arc, time::Duration};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
 use onnx_bert::{Entity, Pipeline};
+use serde::Serialize;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
     task::{spawn_blocking, JoinError, JoinHandle},
     time::sleep,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 
 type Message = (Vec<String>, oneshot::Sender<Result<Vec<Vec<Entity>>>>);
 
@@ -31,6 +38,15 @@ impl IntoResponse for Error {
 
 type Handles = FuturesUnordered<JoinHandle<()>>;
 
+#[instrument]
+async fn get_pipeline() -> Result<Pipeline> {
+    let pipeline =
+        spawn_blocking(|| Pipeline::from_pretrained("amcoff/bert-based-swedish-cased-ner"))
+            .await??;
+
+    Ok(pipeline)
+}
+
 async fn handle_msg(
     (sentences, tx): Message,
     handles: &mut Handles,
@@ -39,14 +55,10 @@ async fn handle_msg(
     if pipeline.is_none() {
         debug!("initializing pipeline");
 
-        match spawn_blocking(|| {
-            Pipeline::from_pretrained("amcoff/bert-based-swedish-cased-ner").unwrap()
-        })
-        .await
-        {
+        match get_pipeline().await {
             Ok(p) => *pipeline = Some(Arc::new(p)),
             Err(e) => {
-                let _ = tx.send(Err(e.into()));
+                let _ = tx.send(Err(e));
                 return;
             }
         }
@@ -59,11 +71,7 @@ async fn handle_msg(
     let handle = tokio::spawn(async move {
         let res = try_join_all(sentences.into_iter().map(move |s| {
             let pipeline = Arc::clone(&pipeline);
-            tokio_rayon::spawn(move || {
-                let p = pipeline.predict(s);
-                debug!("predicted");
-                p
-            })
+            tokio_rayon::spawn(move || pipeline.predict(s))
         }))
         .await;
 
@@ -80,7 +88,7 @@ async fn wait(handles: &mut Handles) {
 }
 
 fn act() -> mpsc::Sender<Message> {
-    let (tx, mut rx) = mpsc::channel::<Message>(10);
+    let (tx, mut rx) = mpsc::channel::<Message>(16);
 
     tokio::spawn(async move {
         let mut pipeline = None;
@@ -118,12 +126,29 @@ async fn predict(
     Ok(Json(res))
 }
 
+#[derive(Debug, Serialize)]
+struct Health {
+    version: &'static str,
+}
+
+async fn health() -> impl IntoResponse {
+    (
+        [("cache-control", "no-cache")],
+        Json(Health {
+            version: env!("CARGO_PKG_VERSION"),
+        }),
+    )
+}
+
 #[tokio::main]
 async fn main() {
+    let _ = dotenv::dotenv();
     tracing_subscriber::fmt::init();
+
     let actor_tx = act();
     let app = Router::new()
         .route("/", post(predict))
+        .route("/health", get(health))
         .with_state(AppState { actor_tx });
 
     info!("binding");
