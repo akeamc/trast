@@ -11,3 +11,5 @@ thiserror = "1.0.38"
 arc-swap = "1.6.0"
 tokio-rayon = "2.1.0"
 futures = "0.3.25"
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }

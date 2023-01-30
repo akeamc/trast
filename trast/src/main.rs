@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
-use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt, TryStreamExt};
+use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
 use onnx_bert::{Entity, Pipeline};
 use tokio::{
     select,
@@ -9,6 +9,7 @@ use tokio::{
     task::{spawn_blocking, JoinError, JoinHandle},
     time::sleep,
 };
+use tracing::{debug, info};
 
 type Message = (Vec<String>, oneshot::Sender<Result<Vec<Vec<Entity>>>>);
 
@@ -36,6 +37,8 @@ async fn handle_msg(
     pipeline: &mut Option<Arc<Pipeline>>,
 ) {
     if pipeline.is_none() {
+        debug!("initializing pipeline");
+
         match spawn_blocking(|| {
             Pipeline::from_pretrained("amcoff/bert-based-swedish-cased-ner").unwrap()
         })
@@ -47,6 +50,8 @@ async fn handle_msg(
                 return;
             }
         }
+
+        debug!("initialized pipeline");
     }
 
     let pipeline = Arc::clone(pipeline.as_ref().unwrap());
@@ -54,7 +59,11 @@ async fn handle_msg(
     let handle = tokio::spawn(async move {
         let res = try_join_all(sentences.into_iter().map(move |s| {
             let pipeline = Arc::clone(&pipeline);
-            tokio_rayon::spawn(move || pipeline.predict(s))
+            tokio_rayon::spawn(move || {
+                let p = pipeline.predict(s);
+                debug!("predicted");
+                p
+            })
         }))
         .await;
 
@@ -75,14 +84,16 @@ fn act() -> mpsc::Sender<Message> {
 
     tokio::spawn(async move {
         let mut pipeline = None;
-
         let mut handles = FuturesUnordered::new();
 
         loop {
             select! {
-                Some(msg) = rx.recv() => { handle_msg(msg, &mut handles, &mut pipeline).await; }
+                Some(msg) = rx.recv() => {
+                    debug!("received message");
+                    handle_msg(msg, &mut handles, &mut pipeline).await;
+                }
                 _ = wait(&mut handles) => if pipeline.take().is_some() {
-                    eprintln!("dropped pipeline");
+                    debug!("dropped pipeline");
                 }
             }
         }
@@ -109,12 +120,13 @@ async fn predict(
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
     let actor_tx = act();
     let app = Router::new()
         .route("/", post(predict))
         .with_state(AppState { actor_tx });
 
-    eprintln!("binding");
+    info!("binding");
 
     axum::Server::bind(&"0.0.0.0:8000".parse().unwrap())
         .serve(app.into_make_service())
