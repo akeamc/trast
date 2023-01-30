@@ -20,6 +20,7 @@ jobs:
           toolchain: stable
           override: true
       - id: prep
+        working-directory: ./trast
         run: |
           echo ::set-output name=version::$(cargo pkgid | cut -d "#" -f2 -)
       - uses: docker/login-action@v2
@@ -31,7 +32,7 @@ jobs:
         with:
           push: ${{ github.ref == 'refs/heads/main' }}
           tags: |
-            ghcr.io/skolorna/trast:${{ steps.prep.outputs.version }}
-            ghcr.io/skolorna/trast:latest
+            ghcr.io/akeamc/trast:${{ steps.prep.outputs.version }}
+            ghcr.io/akeamc/trast:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
