@@ -9,7 +9,7 @@ use tokio::{
     time::sleep,
 };
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument, Instrument};
 use trast_proto::{
     trast_server::{Trast, TrastServer},
     NerInput, NerOutput,
@@ -76,12 +76,12 @@ async fn get_pipeline() -> Result<Pipeline> {
     Ok(pipeline)
 }
 
-async fn handle_msg(
-    (sentence, tx): Message,
-    handles: &mut Handles,
-    pipeline: &mut Option<Arc<Pipeline>>,
-) {
+#[instrument(skip_all, fields(sentence = msg.0, cold = false))]
+async fn handle_msg(msg: Message, handles: &mut Handles, pipeline: &mut Option<Arc<Pipeline>>) {
+    let (sentence, tx) = msg;
+
     if pipeline.is_none() {
+        tracing::Span::current().record("cold", true);
         debug!("initializing pipeline");
 
         match get_pipeline().await {
@@ -97,10 +97,26 @@ async fn handle_msg(
 
     let pipeline = Arc::clone(pipeline.as_ref().unwrap());
 
-    let handle = tokio::spawn(async move {
-        let res = tokio_rayon::spawn(move || pipeline.predict(sentence)).await;
-        let _ = tx.send(res.map_err(Into::into));
-    });
+    debug!("recognizing entities");
+
+    let handle = tokio::spawn(
+        async move {
+            let _ = match tokio_rayon::spawn(move || pipeline.predict(sentence))
+                .in_current_span()
+                .await
+            {
+                Ok(entities) => {
+                    debug!("recognized {} entities", entities.len());
+                    tx.send(Ok(entities))
+                }
+                Err(e) => {
+                    error!(?e);
+                    tx.send(Err(e.into()))
+                }
+            };
+        }
+        .in_current_span(),
+    );
 
     handles.push(handle);
 }
@@ -121,7 +137,6 @@ fn act() -> mpsc::Sender<Message> {
         loop {
             select! {
                 Some(msg) = rx.recv() => {
-                    debug!("received message");
                     handle_msg(msg, &mut handles, &mut pipeline).await;
                 }
                 _ = wait(&mut handles) => if pipeline.take().is_some() {
