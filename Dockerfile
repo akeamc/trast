@@ -7,6 +7,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM clux/muslrust:$RUST_VERSION AS cacher
 RUN cargo install cargo-chef
+RUN ln -s /usr/bin/g++ /usr/bin/musl-g++
 COPY --from=planner /volume/recipe.json recipe.json
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 
