@@ -159,7 +159,7 @@ async fn main() {
         .set_serving::<TrastServer<TrastService>>()
         .await;
 
-    let addr = "[::1]:8000".parse().unwrap();
+    let addr = "0.0.0.0:8000".parse().unwrap();
 
     let trast = TrastService { actor_tx: act() };
 
