@@ -3,7 +3,7 @@ use std::{env, sync::Arc, time::Duration};
 use futures::{stream::FuturesUnordered, StreamExt};
 use onnx_bert::{Entity, Pipeline};
 use opentelemetry::{
-    sdk::{propagation::TraceContextPropagator, Resource},
+    sdk::{propagation::TraceContextPropagator, trace::Sampler, Resource},
     KeyValue,
 };
 use opentelemetry_otlp::WithExportConfig;
@@ -186,16 +186,18 @@ fn init_telemetry(otlp_endpoint: impl Into<String>) -> anyhow::Result<()> {
         .tracing()
         .with_exporter(exporter)
         .with_trace_config(
-            opentelemetry::sdk::trace::config().with_resource(Resource::new(vec![
-                KeyValue::new(
-                    opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-                    env!("CARGO_PKG_NAME"),
-                ),
-                KeyValue::new(
-                    opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
-                    env!("CARGO_PKG_VERSION"),
-                ),
-            ])),
+            opentelemetry::sdk::trace::config()
+                .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+                .with_resource(Resource::new(vec![
+                    KeyValue::new(
+                        opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                        env!("CARGO_PKG_NAME"),
+                    ),
+                    KeyValue::new(
+                        opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                        env!("CARGO_PKG_VERSION"),
+                    ),
+                ])),
         )
         .install_batch(opentelemetry::runtime::Tokio)?;
 
