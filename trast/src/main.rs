@@ -1,7 +1,12 @@
-use std::{sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use onnx_bert::{Entity, Pipeline};
+use opentelemetry::{
+    sdk::{propagation::TraceContextPropagator, Resource},
+    KeyValue,
+};
+use opentelemetry_otlp::WithExportConfig;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
@@ -9,11 +14,18 @@ use tokio::{
     time::sleep,
 };
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{debug, error, info, instrument, Instrument};
+use tracing::{debug, error, info, instrument, metadata::LevelFilter, Instrument, Span};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use trast_proto::{
     trast_server::{Trast, TrastServer},
     NerInput, NerOutput,
 };
+
+use crate::trace::TraceLayer;
+
+mod trace;
+
+const PIPELINE_TTL: Duration = Duration::from_secs(60);
 
 struct TrastService {
     actor_tx: mpsc::Sender<Message>,
@@ -22,9 +34,18 @@ struct TrastService {
 #[tonic::async_trait]
 impl Trast for TrastService {
     async fn ner(&self, request: Request<NerInput>) -> Result<Response<NerOutput>, Status> {
-        let (tx, rx) = oneshot::channel();
         let NerInput { sentence } = request.into_inner();
-        self.actor_tx.send((sentence, tx)).await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        self.actor_tx
+            .send(Message {
+                sentence,
+                tx,
+                span: Span::current(),
+            })
+            .await
+            .unwrap();
+
         let entities = rx.await.unwrap()?.into_iter().map(
             |onnx_bert::Entity {
                  label,
@@ -47,7 +68,12 @@ impl Trast for TrastService {
     }
 }
 
-type Message = (String, oneshot::Sender<Result<Vec<Entity>>>);
+#[derive(Debug)]
+struct Message {
+    sentence: String,
+    tx: oneshot::Sender<Result<Vec<Entity>>>,
+    span: Span,
+}
 
 type Result<T, E = Error> = core::result::Result<T, E>;
 
@@ -69,26 +95,30 @@ type Handles = FuturesUnordered<JoinHandle<()>>;
 
 #[instrument]
 async fn get_pipeline() -> Result<Pipeline> {
-    let pipeline =
-        spawn_blocking(|| Pipeline::from_pretrained("amcoff/bert-based-swedish-cased-ner"))
-            .await??;
-
+    let span = Span::current();
+    let pipeline = spawn_blocking(move || {
+        span.in_scope(|| Pipeline::from_pretrained("amcoff/bert-based-swedish-cased-ner"))
+    })
+    .await??;
     Ok(pipeline)
 }
 
-#[instrument(skip_all, fields(sentence = msg.0, cold = false))]
-async fn handle_msg(msg: Message, handles: &mut Handles, pipeline: &mut Option<Arc<Pipeline>>) {
-    let (sentence, tx) = msg;
+#[instrument(skip_all, fields(cold))]
+async fn spawn_ner_task(
+    sentence: String,
+    cb: oneshot::Sender<Result<Vec<Entity>>>,
+    pipeline: &mut Option<Arc<Pipeline>>,
+) -> Option<JoinHandle<()>> {
+    tracing::Span::current().record("cold", pipeline.is_none());
 
     if pipeline.is_none() {
-        tracing::Span::current().record("cold", true);
         debug!("initializing pipeline");
 
         match get_pipeline().await {
             Ok(p) => *pipeline = Some(Arc::new(p)),
             Err(e) => {
-                let _ = tx.send(Err(e));
-                return;
+                let _ = cb.send(Err(e));
+                return None;
             }
         }
 
@@ -101,29 +131,25 @@ async fn handle_msg(msg: Message, handles: &mut Handles, pipeline: &mut Option<A
 
     let handle = tokio::spawn(
         async move {
-            let _ = match tokio_rayon::spawn(move || pipeline.predict(sentence))
-                .in_current_span()
-                .await
-            {
+            let span = Span::current();
+            match tokio_rayon::spawn(move || span.in_scope(|| pipeline.predict(sentence))).await {
                 Ok(entities) => {
-                    debug!("recognized {} entities", entities.len());
-                    tx.send(Ok(entities))
+                    let _ = cb.send(Ok(entities));
                 }
                 Err(e) => {
                     error!(?e);
-                    tx.send(Err(e.into()))
+                    let _ = cb.send(Err(e.into()));
                 }
             };
         }
         .in_current_span(),
     );
 
-    handles.push(handle);
+    Some(handle)
 }
 
 async fn wait(handles: &mut Handles) {
     while handles.next().await.is_some() {}
-    const PIPELINE_TTL: Duration = Duration::from_secs(10);
     sleep(PIPELINE_TTL).await;
 }
 
@@ -136,8 +162,10 @@ fn act() -> mpsc::Sender<Message> {
 
         loop {
             select! {
-                Some(msg) = rx.recv() => {
-                    handle_msg(msg, &mut handles, &mut pipeline).await;
+                Some(Message { sentence, tx, span }) = rx.recv() => {
+                    if let Some(handle) = spawn_ner_task(sentence, tx, &mut pipeline).instrument(span).await {
+                        handles.push(handle);
+                    }
                 }
                 _ = wait(&mut handles) => if pipeline.take().is_some() {
                     debug!("dropped pipeline");
@@ -149,10 +177,52 @@ fn act() -> mpsc::Sender<Message> {
     tx
 }
 
+fn init_telemetry(otlp_endpoint: impl Into<String>) -> anyhow::Result<()> {
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(otlp_endpoint);
+
+    let tracer = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(exporter)
+        .with_trace_config(
+            opentelemetry::sdk::trace::config().with_resource(Resource::new(vec![
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                    env!("CARGO_PKG_NAME"),
+                ),
+                KeyValue::new(
+                    opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            ])),
+        )
+        .install_batch(opentelemetry::runtime::Tokio)?;
+
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .with(fmt::layer())
+        .with(otel_layer)
+        .init();
+
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let _ = dotenv::dotenv();
-    tracing_subscriber::fmt::init();
+    let otlp_endpoint =
+        env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_owned());
+
+    init_telemetry(otlp_endpoint).unwrap();
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -165,7 +235,12 @@ async fn main() {
 
     info!("listening on {addr}");
 
+    let trace_layer = tower::ServiceBuilder::new()
+        .layer(TraceLayer::default())
+        .into_inner();
+
     Server::builder()
+        .layer(trace_layer)
         .add_service(health_service)
         .add_service(TrastServer::new(trast))
         .serve(addr)

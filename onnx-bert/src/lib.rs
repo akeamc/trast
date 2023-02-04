@@ -49,6 +49,8 @@ impl Pipeline {
         tokenizer: impl AsRef<Path>,
         model: impl AsRef<Path>,
     ) -> Result<Self> {
+        #[cfg(feature = "tracing")]
+        debug!("constructing model");
         let config: Config = serde_json::from_reader(BufReader::new(File::open(config)?))?;
         let tokenizer = Tokenizer::from_file(tokenizer)?;
         let model = tract_onnx::onnx()
@@ -64,9 +66,16 @@ impl Pipeline {
     }
 
     #[cfg(feature = "remote")]
+    #[cfg_attr(feature = "tracing", instrument(skip_all, fields(model)))]
     pub fn from_pretrained(model: impl AsRef<str>) -> Result<Self> {
         let model = model.as_ref();
+
+        #[cfg(feature = "tracing")]
+        tracing::Span::current().record("model", model);
+
         let download_file = |file: &str| {
+            #[cfg(feature = "tracing")]
+            debug!(%file, "downloading file");
             remote::download(format!(
                 "https://huggingface.co/{model}/resolve/main/{file}"
             ))
@@ -79,9 +88,13 @@ impl Pipeline {
         )
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    #[cfg_attr(feature = "tracing", instrument(skip_all, fields(sentence)))]
     pub fn predict(&self, sentence: impl AsRef<str>) -> Result<Vec<Entity>> {
         let sentence = sentence.as_ref();
+
+        #[cfg(feature = "tracing")]
+        tracing::Span::current().record("sentence", sentence);
+
         let input = self
             .tokenizer
             .encode(EncodeInput::Single(sentence.into()), true)?;
