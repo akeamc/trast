@@ -13,6 +13,10 @@ use tokio::{
     task::{spawn_blocking, JoinError, JoinHandle},
     time::sleep,
 };
+use tokio_rayon::{
+    rayon::{ThreadPool, ThreadPoolBuilder},
+    AsyncThreadPool,
+};
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{debug, error, info, instrument, metadata::LevelFilter, Instrument, Span};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -108,6 +112,7 @@ async fn spawn_ner_task(
     sentence: String,
     cb: oneshot::Sender<Result<Vec<Entity>>>,
     pipeline: &mut Option<Arc<Pipeline>>,
+    threadpool: &Arc<ThreadPool>,
 ) -> Option<JoinHandle<()>> {
     tracing::Span::current().record("cold", pipeline.is_none());
 
@@ -126,13 +131,17 @@ async fn spawn_ner_task(
     }
 
     let pipeline = Arc::clone(pipeline.as_ref().unwrap());
+    let threadpool = threadpool.clone();
 
     debug!("recognizing entities");
 
     let handle = tokio::spawn(
         async move {
             let span = Span::current();
-            match tokio_rayon::spawn(move || span.in_scope(|| pipeline.predict(sentence))).await {
+            match threadpool
+                .spawn_fifo_async(move || span.in_scope(|| pipeline.predict(sentence)))
+                .await
+            {
                 Ok(entities) => {
                     let _ = cb.send(Ok(entities));
                 }
@@ -153,22 +162,22 @@ async fn wait(handles: &mut Handles) {
     sleep(PIPELINE_TTL).await;
 }
 
-fn act() -> mpsc::Sender<Message> {
+fn act(threadpool: ThreadPool) -> mpsc::Sender<Message> {
     let (tx, mut rx) = mpsc::channel::<Message>(16);
+    let threadpool = Arc::new(threadpool);
+    let mut pipeline = None;
+    let mut handles = FuturesUnordered::new();
 
     tokio::spawn(async move {
-        let mut pipeline = None;
-        let mut handles = FuturesUnordered::new();
-
         loop {
             select! {
                 Some(Message { sentence, tx, span }) = rx.recv() => {
-                    if let Some(handle) = spawn_ner_task(sentence, tx, &mut pipeline).instrument(span).await {
+                    if let Some(handle) = spawn_ner_task(sentence, tx, &mut pipeline, &threadpool).instrument(span).await {
                         handles.push(handle);
                     }
                 }
                 _ = wait(&mut handles) => if pipeline.take().is_some() {
-                    debug!("dropped pipeline");
+                    info!("dropped pipeline");
                 }
             }
         }
@@ -223,6 +232,10 @@ async fn main() {
     let _ = dotenv::dotenv();
     let otlp_endpoint =
         env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_owned());
+    let num_threads = env::var("NUM_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     init_telemetry(otlp_endpoint).unwrap();
 
@@ -231,9 +244,16 @@ async fn main() {
         .set_serving::<TrastServer<TrastService>>()
         .await;
 
-    let addr = "0.0.0.0:8000".parse().unwrap();
+    let threadpool = ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .unwrap();
 
-    let trast = TrastService { actor_tx: act() };
+    let trast = TrastService {
+        actor_tx: act(threadpool),
+    };
+
+    let addr = "0.0.0.0:8000".parse().unwrap();
 
     info!("listening on {addr}");
 
